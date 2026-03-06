@@ -1,74 +1,114 @@
 /**
- * HideMessages — Kettu Plugin (Mobile)
+ * HideMessages — Pyoncord / ShiggyCord Plugin
  * Ported from Vencord/Equicord by yash
  *
  * Temporarily hides messages from view until the app is restarted.
- * Uses Kettu's mobile-compatible long-press action sheet API.
  */
 
-import { definePlugin } from "@kettu/core";
-import { defineSettings, SettingType } from "@kettu/core/settings";
-import { registerMessageAction } from "@kettu/api/messageActions";
-import { Dispatcher } from "@kettu/discord/dispatcher";
-import type { Message } from "@kettu/discord/types";
+import { instead } from "@vendetta/patcher";
+import { findByProps } from "@vendetta/metro";
+import { after } from "@vendetta/patcher";
+import { storage } from "@vendetta/plugin";
+import { useProxy } from "@vendetta/storage";
+import { React } from "@vendetta/metro/common";
+import { showToast } from "@vendetta/ui/toasts";
 
-// ---------------------------------------------------------------------------
-// Settings
-// ---------------------------------------------------------------------------
+// Defaults
+storage.enabled ??= true;
 
-const settings = defineSettings({
-    enabled: {
-        type: SettingType.BOOLEAN,
-        label: "Enable Hide button",
-        description: "Show a 'Hide' option in the message long-press action sheet.",
-        default: true,
-    },
-});
+// Find Discord's flux dispatcher
+const FluxDispatcher = findByProps("dispatch", "subscribe", "unsubscribe");
 
-// ---------------------------------------------------------------------------
-// Core logic
-// ---------------------------------------------------------------------------
+// Find the message long-press action registry
+const MessageLongPressActionModule = findByProps("registerMessageLongPressAction") 
+    ?? findByProps("addMessageContextOption");
 
 /**
- * Dispatches a local MESSAGE_DELETE so Discord removes the message from
- * the in-memory cache. Nothing is deleted server-side; the message comes
- * back after the app is fully restarted.
+ * Dispatches a local MESSAGE_DELETE.
+ * Nothing is deleted server-side — message returns after app restart.
  */
-function hideMessage(message: Message): void {
-    Dispatcher.dispatch({
+function hideMessage(messageId, channelId) {
+    FluxDispatcher.dispatch({
         type: "MESSAGE_DELETE",
-        id: message.id,
-        channelId: message.channel_id,
+        id: messageId,
+        channelId: channelId,
         mlDeleted: true,
     });
+    showToast("Message hidden until restart.");
 }
 
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
+let unpatch = null;
 
-export default definePlugin({
-    name: "HideMessages",
-    description: "Temporarily hide messages until you restart the app.",
-    version: "1.0.0",
-    authors: ["yash"],
-    settings,
-
+export default {
     onLoad() {
-        // registerMessageAction adds an entry to the long-press action sheet —
-        // the mobile equivalent of a context menu / popover button.
-        registerMessageAction({
-            id: "kettu-hidemessages",
-            label: "Hide Message",
+        if (!storage.enabled) return;
 
-            // Only show the action if the setting is enabled
-            isVisible: () => settings.get("enabled"),
+        if (MessageLongPressActionModule?.registerMessageLongPressAction) {
+            // Pyoncord / ShiggyCord path
+            unpatch = MessageLongPressActionModule.registerMessageLongPressAction({
+                id: "hide-message",
+                label: "Hide Message",
+                action: ({ message }) => {
+                    hideMessage(message.id, message.channel_id);
+                },
+            });
+        } else {
+            // Fallback: patch whatever long-press sheet builder is available
+            const ActionSheetModule = findByProps("openLazy", "hideActionSheet")
+                ?? findByProps("ActionSheet");
 
-            onPress: (message: Message) => hideMessage(message),
-        });
+            const MessageActionSheet = findByProps(
+                "handleMessageLongPress",
+                "MessageContextMenu"
+            );
+
+            if (MessageActionSheet) {
+                unpatch = after(
+                    "handleMessageLongPress",
+                    MessageActionSheet,
+                    ([{ message }], res) => {
+                        if (!storage.enabled) return res;
+
+                        // Inject our option into the resolved action list
+                        if (Array.isArray(res?.props?.children)) {
+                            res.props.children.push(
+                                React.createElement(
+                                    findByProps("PressableScale") ?? "Pressable",
+                                    {
+                                        key: "hide-message",
+                                        onPress: () => {
+                                            hideMessage(message.id, message.channel_id);
+                                            ActionSheetModule?.hideActionSheet?.();
+                                        },
+                                        style: { padding: 12 },
+                                    },
+                                    React.createElement(
+                                        findByProps("Text") ?? "Text",
+                                        { style: { color: "#fff" } },
+                                        "Hide Message"
+                                    )
+                                )
+                            );
+                        }
+                        return res;
+                    }
+                );
+            }
+        }
     },
 
     onUnload() {
-        // Kettu cleans up registered actions automatically on plugin disable.
+        unpatch?.();
+        unpatch = null;
     },
-});
+
+    settings: {
+        enabled: {
+            type: "toggle",
+            label: "Enable Hide Message",
+            description: "Show 'Hide Message' in the long-press action sheet.",
+            default: true,
+            onChange: (v) => { storage.enabled = v; },
+        },
+    },
+};
