@@ -1,24 +1,25 @@
-/**
- * HideMessages — Pyoncord / ShiggyCord Plugin
- * Ported from Vencord/Equicord by yash
- */
+import { findByProps } from "@metro/utils";
+import { after } from "@patcher";
+import { definePlugin } from "@utils/types";
+import { ReactNative as RN } from "@metro/common";
+import { useProxy } from "@lib/storage";
+import { storage } from "@lib/storage";
+import { showToast } from "@lib/ui/toasts";
+import { Forms } from "@lib/ui/components";
 
-import { findByProps, findByName } from "@vendetta/metro";
-import { after } from "@vendetta/patcher";
-import { storage } from "@vendetta/plugin";
-import { useProxy } from "@vendetta/storage";
-import { React } from "@vendetta/metro/common";
-import { showToast } from "@vendetta/ui/toasts";
-import { Forms } from "@vendetta/ui/components";
+const { FormSwitchRow, FormSection } = Forms;
 
-const { FormRow, FormSwitchRow, FormSection, FormDivider } = Forms;
-
+// ---------------------------------------------------------------------------
 // Defaults
-storage.enabled ??= true;
+// ---------------------------------------------------------------------------
+storage.hideEnabled ??= true;
 
+// ---------------------------------------------------------------------------
+// Core logic — local MESSAGE_DELETE, nothing server-side
+// ---------------------------------------------------------------------------
 const FluxDispatcher = findByProps("dispatch", "_currentDispatchActionType");
 
-function hideMessage(messageId, channelId) {
+function hideMessage(messageId: string, channelId: string) {
     FluxDispatcher.dispatch({
         type: "MESSAGE_DELETE",
         id: messageId,
@@ -28,110 +29,74 @@ function hideMessage(messageId, channelId) {
     showToast("Message hidden until restart.");
 }
 
-// The actual bottom sheet shown on long press — visible in your screenshot
-const MessageContextMenu = findByName("MessageContextMenu", false)
-    ?? findByProps("MessageContextMenu")?.MessageContextMenu;
+// ---------------------------------------------------------------------------
+// Context menu patch — Bunny/Kettu style
+// The `contextMenus` field is the correct way to patch long-press menus.
+// Key: "message" matches the MessageContextMenu sheet shown on long-press.
+// ---------------------------------------------------------------------------
+export default definePlugin({
+    name: "HideMessages",
+    description: "Temporarily hide a message from view until you restart the app.",
+    authors: [{ name: "yash", id: "0" }],
 
-let unpatch = null;
+    // This is the Bunny/Kettu equivalent of Vencord's contextMenus field.
+    // It receives (children, props) just like NavContextMenuPatchCallback.
+    contextMenus: {
+        message(children: any[], props: { message: any }) {
+            if (!storage.hideEnabled) return;
+            if (!props?.message) return;
 
-export default {
-    onLoad() {
-        if (!MessageContextMenu) {
-            showToast("HideMessages: Could not find MessageContextMenu");
-            return;
-        }
+            const { message } = props;
 
-        unpatch = after("default", MessageContextMenu, ([props], res) => {
-            if (!storage.enabled) return res;
+            // Find the group containing "copy-text" and splice in after it,
+            // falling back to pushing at end if not found.
+            let inserted = false;
+            for (const group of children) {
+                const items: any[] = group?.props?.children;
+                if (!Array.isArray(items)) continue;
 
-            const message = props?.message;
-            if (!message) return res;
-
-            // Walk the tree to find the children array of the sheet
-            const children = res?.props?.children;
-            if (!children) return res;
-
-            const flatChildren = Array.isArray(children)
-                ? children
-                : [children];
-
-            // Build a plain pressable row matching Discord's native style
-            const { Text, Pressable, View } = require("react-native");
-
-            const hideRow = React.createElement(
-                View,
-                {
-                    key: "hide-message-row",
-                    style: {
-                        flexDirection: "row",
-                        alignItems: "center",
-                        paddingHorizontal: 16,
-                        paddingVertical: 14,
-                        borderTopWidth: 0.5,
-                        borderTopColor: "rgba(255,255,255,0.08)",
-                    }
-                },
-                React.createElement(
-                    Pressable,
-                    {
-                        style: { flex: 1, flexDirection: "row", alignItems: "center" },
-                        onPress: () => {
-                            hideMessage(message.id, message.channel_id);
-                            // Dismiss the sheet
-                            const ActionSheet = findByProps("hideActionSheet");
-                            ActionSheet?.hideActionSheet?.();
-                        }
-                    },
-                    React.createElement(
-                        Text,
-                        {
-                            style: {
-                                color: "#FFFFFF",
-                                fontSize: 16,
-                                marginLeft: 16,
-                            }
-                        },
-                        "Hide Message"
-                    )
-                )
-            );
-
-            // Insert before "Delete Message" (last item) or just push
-            if (Array.isArray(res.props.children)) {
-                const deleteIndex = res.props.children.findLastIndex?.(
-                    c => c?.props?.message === "Delete Message"
-                        || c?.key === "delete-message"
-                ) ?? -1;
-
-                if (deleteIndex > -1) {
-                    res.props.children.splice(deleteIndex, 0, hideRow);
-                } else {
-                    res.props.children.push(hideRow);
+                const idx = items.findIndex((c: any) => c?.props?.id === "copy-text");
+                if (idx !== -1) {
+                    items.splice(idx + 1, 0, {
+                        // Plain action object — Bunny renders these natively
+                        key: "hide-message",
+                        id: "hide-message",
+                        label: "Hide Message",
+                        action: () => hideMessage(message.id, message.channel_id),
+                    });
+                    inserted = true;
+                    break;
                 }
             }
 
-            return res;
-        });
+            if (!inserted) {
+                // Fallback: push to last group
+                const lastGroup = children[children.length - 1];
+                const items = lastGroup?.props?.children;
+                if (Array.isArray(items)) {
+                    items.push({
+                        key: "hide-message",
+                        id: "hide-message",
+                        label: "Hide Message",
+                        action: () => hideMessage(message.id, message.channel_id),
+                    });
+                }
+            }
+        },
     },
 
-    onUnload() {
-        unpatch?.();
-        unpatch = null;
-    },
-
-    // Pyoncord settings: must be a React component function
-    settings: () => {
+    // Settings screen — must be a React component function for Bunny/Kettu
+    settings() {
         const proxy = useProxy(storage);
-
-        return React.createElement(
-            FormSection,
-            { title: "HideMessages" },
-            React.createElement(FormSwitchRow, {
-                label: "Enable Hide Message",
-                subLabel: "Show 'Hide Message' in the long-press sheet.",
-                value: proxy.enabled,
-                onValueChange: (v) => { proxy.enabled = v; },
-            })
+        return (
+            <FormSection title="HideMessages">
+                <FormSwitchRow
+                    label="Enable Hide Message"
+                    subLabel="Show 'Hide Message' in the long-press action sheet."
+                    value={proxy.hideEnabled}
+                    onValueChange={(v: boolean) => { proxy.hideEnabled = v; }}
+                />
+            </FormSection>
         );
     },
-};
+});
